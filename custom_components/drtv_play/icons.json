@@ -1,0 +1,6 @@
+{
+    "services": {
+        "play_latest": "mdi:play-box-multiple",
+        "play_channel": "mdi:television-classic"
+    }
+}
