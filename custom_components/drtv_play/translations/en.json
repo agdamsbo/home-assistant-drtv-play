@@ -1,0 +1,85 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "Connect to DRTV",
+                "description": "Leave both fields empty to browse DRTV anonymously. Log in with your DRTV account to also sync \"My List\" and \"Continue watching\" into the media browser, just like the Kodi add-on's settings screen offers.",
+                "data": {
+                    "username": "Email (leave empty for anonymous)",
+                    "password": "Password"
+                }
+            },
+            "reauth_confirm": {
+                "title": "Reauthenticate with DRTV",
+                "description": "Your DRTV login has stopped working, most likely because the password changed. Enter your current DRTV email and password to reconnect.",
+                "data": {
+                    "username": "Email",
+                    "password": "Password"
+                }
+            }
+        },
+        "error": {
+            "password_required": "A password is required when an email is given.",
+            "username_required": "An email is required when a password is given.",
+            "invalid_auth": "Could not sign in to DRTV with these credentials.",
+            "cannot_connect": "Could not reach DRTV. Check your Home Assistant internet connection and try again.",
+            "unknown": "Unexpected error, see the Home Assistant log for details."
+        },
+        "abort": {
+            "already_configured": "This DRTV account (or the anonymous source) is already set up.",
+            "reauth_successful": "Reauthentication was successful.",
+            "wrong_account": "The credentials entered belong to a different DRTV account than the one being reauthenticated. Remove and re-add the integration to switch accounts."
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "DRTV account",
+                "description": "Update or remove the DRTV account used for \"My List\" and \"Continue watching\". Clear both fields to switch back to anonymous browsing.",
+                "data": {
+                    "username": "Email (leave empty for anonymous)",
+                    "password": "Password"
+                }
+            }
+        },
+        "error": {
+            "password_required": "A password is required when an email is given.",
+            "username_required": "An email is required when a password is given.",
+            "invalid_auth": "Could not sign in to DRTV with these credentials."
+        }
+    },
+    "services": {
+        "play_latest": {
+            "name": "Play latest",
+            "description": "Play the latest episode from a specific DRTV show.",
+            "fields": {
+                "entity_id": {
+                    "name": "Media player",
+                    "description": "The media player to play on."
+                },
+                "program_name": {
+                    "name": "Program name",
+                    "description": "Search term, DRTV path (e.g. /serie/...) or program id."
+                }
+            }
+        },
+        "play_channel": {
+            "name": "Play channel",
+            "description": "Play one of the DRTV live channels.",
+            "fields": {
+                "entity_id": {
+                    "name": "Media player",
+                    "description": "The media player to play on."
+                },
+                "channel": {
+                    "name": "Channel",
+                    "description": "DR1, DR2, DRTV, DRTV Ekstra or DR Ramasjang."
+                },
+                "subtitles": {
+                    "name": "Subtitles",
+                    "description": "Play the channel with subtitles."
+                }
+            }
+        }
+    }
+}
