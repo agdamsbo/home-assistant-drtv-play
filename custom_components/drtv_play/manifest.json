@@ -1,15 +1,17 @@
 {
     "domain": "drtv_play",
     "name": "DRTV Play",
-    "version": "0.1.0",
-    "documentation": "https://github.com/TermeHansen/home-assistant-drtv-play",
-    "issue_tracker": "https://github.com/TermeHansen/home-assistant-drtv-play/issues",
+    "version": "0.3.0",
+    "documentation": "https://github.com/agdamsbo/home-assistant-drtv-play",
+    "issue_tracker": "https://github.com/agdamsbo/home-assistant-drtv-play/issues",
     "iot_class": "cloud_polling",
+    "config_flow": true,
     "dependencies": [
         "media_player"
     ],
     "codeowners": [],
     "requirements": [
-        "requests_cache"
+        "requests_cache",
+        "python-dateutil"
     ]
 }
