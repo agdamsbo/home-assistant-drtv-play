@@ -77,7 +77,7 @@ class DrtvPlayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
-        return DrtvPlayOptionsFlow(config_entry)
+        return DrtvPlayOptionsFlow()
 
     async def async_step_reauth(self, entry_data: dict[str, Any]):
         """Start a reauth flow when a saved login stops working."""
@@ -117,10 +117,13 @@ class DrtvPlayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class DrtvPlayOptionsFlow(config_entries.OptionsFlow):
-    """Allow updating/removing stored DRTV credentials after setup."""
+    """Allow updating/removing stored DRTV credentials after setup.
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
+    `config_entry` is provided automatically as a read-only property by
+    the base class - it must not be assigned in __init__ (that pattern
+    was deprecated in HA 2024.12 and removed in 2025.12, and raises
+    AttributeError, seen in the UI as a 500 error opening this flow).
+    """
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
