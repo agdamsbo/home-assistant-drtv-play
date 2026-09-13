@@ -1,18 +1,25 @@
 #
-#  This code comes from the Kodi drnu. 
+#  This code comes from the Kodi drnu addon.
 #  https://github.com/xbmc-danish-addons/plugin.video.drnu
 #
+#  The login flow (full_login/oidc_token/refresh_token/exchange_token) is
+#  ported from that addon's current tvapi.py so that a DRTV account can be
+#  used to browse/sync "My List" and "Continue watching", not just
+#  anonymous catalogue browsing.
+#
 
+import base64
 import hashlib
-import json
-from pathlib import Path
 import pickle
+import secrets
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
 import requests
 import requests_cache
-import time
 from dateutil import parser
-from datetime import datetime, timezone, timedelta
-
 
 CHANNEL_IDS = [20875, 20876, 192099, 192100, 20892]
 CHANNEL_PRESET = {
@@ -23,23 +30,230 @@ CHANNEL_PRESET = {
     'DRTV Ekstra': 5
 }
 URL = 'https://production.dr-massive.com/api'
-GET_TIMEOUT = 5
+LOGIN_GRAPHQL_URL = 'https://login.dr.dk/graphql'
+LOGIN_AUTHORIZE_URL = 'https://login.dr.dk/oidc/authorize'
+LOGIN_TOKEN_URL = 'https://login.dr.dk/oidc/token'
+CLIENT_ID = '283ba39a2cf31d3b81e922b8'
+REDIRECT_URI = 'https://www.dr.dk/drtv/callback'
+GET_TIMEOUT = 10
 CACHEPATH = Path(__file__).parent/'cache'
 CACHEPATH.mkdir(exist_ok=True, parents=True)
 EXPIRE_HOURS = 24
 CLEAUP_EVERY = 7
+TOKEN_REFRESH_MARGIN = timedelta(hours=1)
+
+
+class ApiException(Exception):
+    # normally pass this exception, to keep API alive in production
+    pass
+
+
+class ApiAuthException(ApiException):
+    """Raised when a login (initial or refresh) fails - credentials are bad."""
+
+
+# ---------------------------------------------------------------------------
+# Login helpers. These are plain functions (no Api instance needed) since
+# they're also used by the config flow to validate credentials before an
+# Api object - and its on-disk token cache - is created.
+# ---------------------------------------------------------------------------
+
+def _generate_code_verifier(length: int = 64) -> str:
+    return secrets.token_urlsafe(length)[:length]
+
+
+def _generate_code_challenge(code_verifier: str) -> str:
+    sha256 = hashlib.sha256(code_verifier.encode()).digest()
+    return base64.urlsafe_b64encode(sha256).decode().rstrip('=')
+
+
+# The transaction fragment/queries below are DR's login.dr.dk GraphQL
+# contract. They're copied verbatim from the working Kodi add-on rather
+# than trimmed, since this is a strict schema and DR does not publish
+# stable documentation for it.
+_TRANSACTION_FRAGMENT = (
+    "fragment useTransactionTransactionFragment on Transaction { "
+    "... on AuthenticatedAuthenticationTransaction { id email registration href __typename } "
+    "... on UnauthenticatedAuthenticationTransaction { id email __typename } "
+    "... on UnverifiedAuthenticationTransaction { id email name __typename } "
+    "... on UnrecognizedAuthenticationTransaction { id email statisticsConsentDefinition "
+    "{ id type version locale permissions headline summary body __typename } "
+    "preferencesConsentDefinition { id type version locale permissions headline summary body __typename } "
+    "newsletterConsentDefinition { id type version locale permissions headline summary body __typename } "
+    "__typename } "
+    "... on UnidentifiedAuthenticationTransaction { id __typename } "
+    "... on CompletedEmailVerificationTransaction { id emailVerificationVariant: variant email __typename } "
+    "... on PendingEmailVerificationTransaction { id emailVerificationVariant: variant email __typename } "
+    "... on CompletedPasswordChangeTransaction { id passwordChangeVariant: variant __typename } "
+    "... on PendingPasswordChangeTransaction { id passwordChangeVariant: variant __typename } "
+    "... on PendingDeletionConfirmationTransaction { id __typename } "
+    "... on CompletedDeletionConfirmationTransaction { id __typename } "
+    "... on SettingsTransaction { id identity { id email name roles __typename } "
+    "statisticsConsentDefinition { id type version locale permissions headline summary body __typename } "
+    "preferencesConsentDefinition { id type version locale permissions headline summary body __typename } "
+    "newsletterConsentDefinition { id type version locale permissions headline summary body __typename } "
+    "statisticsConsentRevision { id status definition createdAt __typename } "
+    "preferencesConsentRevision { id status definition createdAt __typename } "
+    "newsletterConsentRevision { id status definition createdAt __typename } "
+    "referBackUri referBackName sessionState expiresAt __typename } "
+    "... on PendingEUPTransaction { id href __typename } "
+    "... on CompletedEUPTransaction { id __typename } __typename }"
+)
+_TRANSACTION_QUERY = (
+    "query useTransactionTransactionQuery($id: ID!) { transaction(id: $id) { "
+    "... on Node { id __typename } ...useTransactionTransactionFragment __typename } }"
+    + _TRANSACTION_FRAGMENT
+)
+_IDENTIFY_QUERY = (
+    "mutation useTransactionIdentificationMutation($input: IdentificationInput!) { "
+    "identify(input: $input) { ... on Node { id __typename } ... on Error { code message __typename } "
+    "...useTransactionTransactionFragment __typename } }"
+    + _TRANSACTION_FRAGMENT
+)
+_AUTHENTICATE_QUERY = (
+    "mutation useTransactionAuthenticationMutation($input: AuthenticationInput!) { "
+    "authenticate(input: $input) { ... on Node { id __typename } ... on Error { code message __typename } "
+    "...useTransactionTransactionFragment __typename } }"
+    + _TRANSACTION_FRAGMENT
+)
+
+
+def _oidc_token(data: dict) -> dict:
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
+    res = requests.post(LOGIN_TOKEN_URL, data=data, headers=headers, timeout=GET_TIMEOUT)
+    if res.status_code != 200:
+        return {'status_code': res.status_code, 'error': res.text}
+    return res.json()
+
+
+def refresh_token(refresh_token_value: str) -> dict:
+    data = {"client_id": CLIENT_ID, "refresh_token": refresh_token_value, "grant_type": "refresh_token"}
+    return _oidc_token(data)
+
+
+def exchange_token(tokens: dict) -> dict:
+    data = {
+        "accessToken": tokens['access_token'], "identityToken": tokens['id_token'],
+        "scopes": ["Catalog"], "device": "web_browser", "optout": False,
+    }
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    res = requests.post(URL + '/authorization/exchange', json=data, headers=headers, timeout=GET_TIMEOUT)
+    if res.status_code != 200:
+        return {'status_code': res.status_code, 'error': res.text}
+    return res.json()
+
+
+def full_login(email: str, password: str) -> dict:
+    """Log in with a DRTV email/password and return OIDC access tokens.
+
+    This is a headless port of DR's web login flow: it drives the same
+    login.dr.dk "transaction" GraphQL API the https://dr.dk/drtv web
+    frontend uses, rather than opening a browser. On success this
+    returns a dict with access_token/id_token/refresh_token (suitable
+    for exchange_token()); on failure it returns {'error': ...}.
+    """
+    session = requests.Session()
+
+    code_verifier = _generate_code_verifier()
+    code_challenge = _generate_code_challenge(code_verifier)
+    params = {
+        "client_id": CLIENT_ID,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "redirect_uri": REDIRECT_URI,
+        "state": f'{{"code_verifier":"{code_verifier}","logonRedirectPath":"/","optout":false}}',
+        "response_type": "code",
+        "scope": "openid roles tracking profile email offline_access",
+    }
+    res = session.get(LOGIN_AUTHORIZE_URL, params=params, timeout=GET_TIMEOUT)
+    if res.status_code != 200:
+        return {'status_code': res.status_code, 'error': res.text}
+
+    trans = urlparse(res.url).path.split('/')[-1]
+    headers = {'content-type': 'application/json'}
+
+    trans_data = {
+        "operationName": "useTransactionTransactionQuery",
+        "variables": {"id": trans}, "query": _TRANSACTION_QUERY,
+    }
+    identify_data = {
+        "operationName": "useTransactionIdentificationMutation",
+        "variables": {"input": {"transaction": trans, "email": email}}, "query": _IDENTIFY_QUERY,
+    }
+    authenticate_data = {
+        "operationName": "useTransactionAuthenticationMutation",
+        "variables": {"input": {"transaction": trans, "password": password}}, "query": _AUTHENTICATE_QUERY,
+    }
+
+    session.post(LOGIN_GRAPHQL_URL, json=trans_data, headers=headers, timeout=GET_TIMEOUT)
+    session.post(LOGIN_GRAPHQL_URL, json=identify_data, headers=headers, timeout=GET_TIMEOUT)
+    auth_res = session.post(LOGIN_GRAPHQL_URL, json=authenticate_data, headers=headers, timeout=GET_TIMEOUT)
+
+    auth_json = auth_res.json()
+    authenticate = auth_json.get('data', {}).get('authenticate') or {}
+    if 'errors' in auth_json or authenticate.get('__typename') == 'Error':
+        message = authenticate.get('message') or auth_json.get('errors', [{}])[0].get('message', 'login failed')
+        return {'error': message}
+    href = authenticate.get('href')
+    if not href:
+        # e.g. wrong password -> UnauthenticatedAuthenticationTransaction with no href
+        return {'error': 'invalid_credentials'}
+
+    res2 = session.get(href, timeout=GET_TIMEOUT)
+    if res2.status_code != 200:
+        return {'status_code': res2.status_code, 'error': res2.text}
+    codes = parse_qs(urlparse(res2.url).query).get('code')
+    if not codes:
+        return {'error': 'invalid_credentials'}
+
+    data = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "code_verifier": code_verifier,
+        "code": codes[0],
+        "grant_type": "authorization_code",
+    }
+    return _oidc_token(data)
+
+
+def anonymous_tokens() -> dict:
+    data = {"deviceId": _deviceid(), "scopes": ["Catalog"], "optout": False}
+    params = {'device': 'web_browser', 'ff': 'idp,ldp,rpt', 'lang': 'da', 'supportFallbackToken': True}
+    res = requests.post(URL + '/authorization/anonymous-sso?', json=data, params=params, timeout=GET_TIMEOUT)
+    if res.status_code != 200:
+        return {'status_code': res.status_code, 'error': res.text}
+    return res.json()
+
+
+def _deviceid() -> str:
+    v = int(Path(__file__).stat().st_mtime)
+    h = hashlib.md5(str(v).encode('utf-8')).hexdigest()
+    return '-'.join([h[:8], h[8:12], h[12:16], h[16:20], h[20:32]])
+
 
 class Api():
-    def __init__(self):
-        self.cachePath = CACHEPATH
-        self.expire_hours = EXPIRE_HOURS
-        self.cleanup_every = CLEAUP_EVERY
-        self.caching = True
+    def __init__(self, username=None, password=None, cache_path=None,
+                 caching=True, expire_hours=EXPIRE_HOURS, cleanup_every=CLEAUP_EVERY):
+        self.username = username or None
+        self.password = password or None
+        self.cachePath = cache_path or CACHEPATH
+        self.cachePath.mkdir(exist_ok=True, parents=True)
+        self.expire_hours = expire_hours
+        self.cleanup_every = cleanup_every
+        self.caching = caching
         self.expire_seconds = 3600*self.expire_hours if self.expire_hours >= 0 else self.expire_hours
+        self.access_tokens = {}
+        self._user_name = ''
+        self._user_token = None
+        self._profile_token = None
+        self._token_expire = None
         self.init_sqlite_db()
 
-        self.token_file = Path(f'{self.cachePath}/token.p')
-        self._user_token = None
+        # Anonymous and logged-in sessions are cached separately so
+        # switching accounts (or logging out) doesn't reuse stale tokens.
+        slug = 'anon' if not self.username else hashlib.md5(self.username.encode('utf-8')).hexdigest()[:12]
+        self.token_file = Path(f'{self.cachePath}/token_{slug}.p')
+
         self.refresh_tokens()
 
     def init_sqlite_db(self):
@@ -65,41 +279,109 @@ class Api():
                 request_fname, backend='sqlite', expire_after=self.expire_seconds)
         (self.cachePath/'requests_cleaned').write_text(str(datetime.now()))
 
-    def deviceid(self):
-        v = int(Path(__file__).stat().st_mtime)
-        h = hashlib.md5(str(v).encode('utf-8')).hexdigest()
-        return '-'.join([h[:8], h[8:12], h[12:16], h[16:20], h[20:32]])
+    # ------------------------------------------------------------------
+    # Authentication
+    # ------------------------------------------------------------------
 
-    def read_token(self, tokens):
-        time_struct = time.strptime(tokens[0]['expirationDate'].split('.')[0], '%Y-%m-%dT%H:%M:%S')
-        self._token_expire = datetime(*time_struct[0:6])
-        self._user_token = tokens[0]['value']
-        self._profile_token = tokens[1]['value']
+    @property
+    def logged_in(self) -> bool:
+        return bool(self.username)
+
+    @property
+    def user_name(self) -> str:
+        if not self._user_name:
+            if not self.logged_in:
+                self._user_name = 'anonymous'
+            else:
+                try:
+                    self._user_name = self.get_profile().get('name', self.username)
+                except ApiException:
+                    self._user_name = self.username
+        return self._user_name
+
+    def read_tokens(self, tokens):
+        if 'value' in tokens[0]:
+            # anonymous flow
+            time_str = tokens[0]['expirationDate'].split('.')[0]
+            self._user_token = tokens[0]['value']
+            self._profile_token = tokens[1]['value']
+            self._user_name = 'anonymous'
+        else:
+            # oidc/logged-in flow
+            time_str = tokens[0]['Expires'].split('.')[0]
+            self._user_token = tokens[0]['Token']
+            self._profile_token = tokens[1]['Token']
+            self._user_name = ''
+
+        try:
+            self._token_expire = datetime.strptime(time_str + 'Z', '%Y-%m-%dT%H:%M:%S%z')
+        except ValueError:
+            time_struct = time.strptime(time_str, '%Y-%m-%dT%H:%M:%S')
+            self._token_expire = datetime(*time_struct[0:6], tzinfo=timezone.utc)
 
     def request_tokens(self):
-        data = {"deviceId": self.deviceid(), "scopes": ["Catalog"], "optout": False}
-        params = {'device': 'web_browser', 'ff': 'idp,ldp,rpt', 'lang': 'da', 'supportFallbackToken': True}
-
-        url = URL + '/authorization/anonymous-sso?'
-        u = requests.post(url, json=data, params=params)
+        """(Re)authenticate from scratch. Returns an error string, or None on success."""
         self._user_token = None
-        if u.status_code == 200:
-            with self.token_file.open('wb') as fh:
-                tokens = json.loads(u.content)
-                pickle.dump(tokens, fh)
-            self.read_token(tokens)
+        self._profile_token = None
+
+        if self.logged_in:
+            access_tokens = full_login(self.username, self.password)
+            if 'error' in access_tokens:
+                return access_tokens['error']
+            self.access_tokens = access_tokens
+            tokens = exchange_token(access_tokens)
         else:
-            raise ApiException(f'Failed to get new token from: {url}')
+            self.access_tokens = {}
+            tokens = anonymous_tokens()
+
+        if 'error' in tokens:
+            return tokens['error']
+
+        self.read_tokens(tokens)
+        with self.token_file.open('wb') as fh:
+            pickle.dump([tokens, self.access_tokens], fh)
+        return None
 
     def refresh_tokens(self):
-        if self._user_token is None:
-            if self.token_file.exists():
+        if self._user_token is None and self.token_file.exists():
+            try:
                 with self.token_file.open('rb') as fh:
-                    self.read_token(pickle.load(fh))
+                    loaded = pickle.load(fh)
+                if isinstance(loaded, list) and len(loaded) == 2:
+                    tokens, self.access_tokens = loaded
+                    self.read_tokens(tokens)
+            except Exception:  # noqa: BLE001 - corrupt/old cache file, just re-authenticate
+                self._user_token = None
+
+        if self._user_token is None:
+            err = self.request_tokens()
+            if err:
+                raise ApiAuthException(f'DRTV login failed: {err}')
+            return
+
+        if self._token_expire and (self._token_expire - datetime.now(timezone.utc)) < TOKEN_REFRESH_MARGIN:
+            failed_refresh = not (self.logged_in and 'refresh_token' in self.access_tokens)
+            tokens = None
+            if not failed_refresh:
+                access_tokens = refresh_token(self.access_tokens['refresh_token'])
+                if 'error' in access_tokens:
+                    failed_refresh = True
+                    self.access_tokens = {}
+                else:
+                    tokens = exchange_token(access_tokens)
+                    if 'error' in tokens:
+                        failed_refresh = True
+                    else:
+                        self.access_tokens = access_tokens
+
+            if failed_refresh:
+                err = self.request_tokens()
+                if err:
+                    raise ApiAuthException(f'DRTV login failed: {err}')
             else:
-                self.request_tokens()
-        if (self._token_expire - datetime.now()).total_seconds() < 120:
-            self.request_tokens()
+                self.read_tokens(tokens)
+                with self.token_file.open('wb') as fh:
+                    pickle.dump([tokens, self.access_tokens], fh)
 
     def user_token(self):
         self.refresh_tokens()
@@ -108,6 +390,26 @@ class Api():
     def profile_token(self):
         self.refresh_tokens()
         return self._profile_token
+
+    # ------------------------------------------------------------------
+    # Generic request helper
+    # ------------------------------------------------------------------
+
+    def _request_get(self, url, params=None, headers=None, use_cache=True):
+        if use_cache and self.caching:
+            u = self.session.get(url, params=params, headers=headers, timeout=GET_TIMEOUT)
+        else:
+            u = requests.get(url, params=params, headers=headers, timeout=GET_TIMEOUT)
+        if u.status_code == 200:
+            return u.json()
+        raise ApiException(u.text)
+
+    def _auth_headers(self):
+        return {"X-Authorization": f'Bearer {self.profile_token()}'}
+
+    # ------------------------------------------------------------------
+    # Browsing
+    # ------------------------------------------------------------------
 
     def get_programcard(self, path, data=None, use_cache=True, ff='ldp,rpt'):
         url = URL + '/page?'
@@ -121,37 +423,15 @@ class Api():
             }
         else:
             data['path'] = path
-
-        if use_cache and self.caching:
-            u = self.session.get(url, params=data, timeout=GET_TIMEOUT)
-        else:
-            u = requests.get(url, params=data, timeout=GET_TIMEOUT)
-        if u.status_code == 200:
-            return u.json()
-        else:
-            raise ApiException(u.text)
+        return self._request_get(url, params=data, use_cache=use_cache)
 
     def get_item(self, id, use_cache=True):
         url = URL + f'/items/{int(id)}?'
-        if use_cache and self.caching:
-            u = self.session.get(url, timeout=GET_TIMEOUT)
-        else:
-            u = requests.get(url, timeout=GET_TIMEOUT)
-        if u.status_code == 200:
-            return u.json()
-        else:
-            raise ApiException(u.text)
+        return self._request_get(url, use_cache=use_cache)
 
-    def get_next(self, path, use_cache=True):
+    def get_next(self, path, use_cache=True, headers=None):
         url = URL + path
-        if use_cache and self.caching:
-            u = self.session.get(url, timeout=GET_TIMEOUT)
-        else:
-            u = requests.get(url, timeout=GET_TIMEOUT)
-        if u.status_code == 200:
-            return u.json()
-        else:
-            raise ApiException(u.text)
+        return self._request_get(url, headers=headers, use_cache=use_cache)
 
     def get_list(self, id, param, use_cache=True):
         if isinstance(id, str):
@@ -160,29 +440,12 @@ class Api():
         data = {'page_size': '24'}
         if param != 'NoParam':
             data['param'] = param
-
-        if use_cache and self.caching:
-            u = self.session.get(url, params=data, timeout=GET_TIMEOUT)
-        else:
-            u = requests.get(url, params=data, timeout=GET_TIMEOUT)
-        if u.status_code == 200:
-            return u.json()
-        else:
-            raise ApiException(u.text)
+        return self._request_get(url, params=data, use_cache=use_cache)
 
     def get_recommendations(self, id, use_cache=True):
         url = URL + f'/recommendations/{id}'
         data = {'page_size': '24'}
-        headers = {"X-Authorization": f'Bearer {self.profile_token()}'}
-
-        if use_cache and self.caching:
-            u = self.session.get(url, params=data, headers=headers, timeout=GET_TIMEOUT)
-        else:
-            u = requests.get(url, params=data, headers=headers, timeout=GET_TIMEOUT)
-        if u.status_code == 200:
-            return u.json()
-        else:
-            raise ApiException(u.text)
+        return self._request_get(url, params=data, headers=self._auth_headers(), use_cache=use_cache)
 
     def kids_item(self, item):
         if 'classification' in item:
@@ -194,32 +457,25 @@ class Api():
                     return True
         return False
 
-    def unfold_list(self, item, filter_kids=False):
+    def unfold_list(self, item, filter_kids=False, headers=None):
         items = item['items']
-        if 'next' in item['paging']:
-            next_js = self.get_next(item['paging']['next'])
+        next_js = item
+        while 'next' in next_js.get('paging', {}):
+            next_js = self.get_next(next_js['paging']['next'], headers=headers)
             items += next_js['items']
-            while 'next' in next_js['paging']:
-                next_js = self.get_next(next_js['paging']['next'])
-                items += next_js['items']
         if filter_kids:
             items = [item for item in items if not self.kids_item(item)]
         return items
 
     def search(self, term):
         url = URL + '/search'
-        headers = {"X-Authorization": f'Bearer {self.profile_token()}'}
         data = {
             'item_detail_expand': 'all',
             'list_page_size': '24',
             'group': 'true',
             'term': term
         }
-        u = self.session.get(url, params=data, headers=headers, timeout=GET_TIMEOUT)
-        if u.status_code == 200:
-            return u.json()
-        else:
-            raise ApiException(u.text)
+        return self._request_get(url, params=data, headers=self._auth_headers(), use_cache=False)
 
     def get_latest(self, term):
         item = {}
@@ -229,30 +485,27 @@ class Api():
             id = None
 
         if term.startswith('/'):
-            path = '/serie/alene-i-vildmarken_69758'
+            path = term
         elif id:
             path = self.get_item(id)['path']
         else:
             # search
             res = self.search(term)
             path = ''
-            for key,val in res.items():
+            for key, val in res.items():
                 if key not in ['term', 'total', 'people']:
-    #                print(key, val['size'])
                     if val['size'] > 0:
                         path = res[key]['items'][0]['path']
                         break
         if path:
-    #        print(key, path)
             card = self.get_programcard(path, ff='idp,ldp,rpt')
             if card['item']['type'] == 'episode':
                 # Make sure we get the latest episode, fix error for bonderøven
                 season = 0
-                for item in card['item']['season']['show']['seasons']['items']:
-                    if item['seasonNumber'] > season:
-    #                    print(item['seasonNumber'], item['path'])
-                        season = item['seasonNumber']
-                        path = item['path']
+                for season_item in card['item']['season']['show']['seasons']['items']:
+                    if season_item['seasonNumber'] > season:
+                        season = season_item['seasonNumber']
+                        path = season_item['path']
                 if season > 0:
                     card = self.get_programcard(path, ff='idp,ldp,rpt')
 
@@ -270,8 +523,6 @@ class Api():
 
             elif card['item']['type'] == 'program':
                 item = card['item']
-            else:
-                print(key, card['item']['type'], card['item']['title'])
         return item
 
     def get_home(self):
@@ -288,7 +539,7 @@ class Api():
             title = item['title']
             if title not in ['Se Live TV', 'Vi tror, du kan lide']:  # TODO activate again when login works
                 if title == '' and item['type'] == 'ListEntry':
-                    title = item['list'].get('title', '') # get the top spinner item
+                    title = item['list'].get('title', '')  # get the top spinner item
                 if title.startswith('DRTV Hero'):
                     title = 'Daglige forslag'
                 if title:
@@ -310,7 +561,7 @@ class Api():
             'dr-minisjang': '/minisjang/a-aa',
             'dr-ultra': '/ultra_a-aa',
             'dr': '/kategorier/a-aa',
-            }
+        }
         name = names[channel]
         js = self.get_programcard(name)
         items = []
@@ -330,22 +581,20 @@ class Api():
             'resolution': 'HD-1080',
             'sub': 'Anonymous'
         }
-
         u = self.session.get(url, params=data, headers=headers, timeout=GET_TIMEOUT)
         if u.status_code == 200:
             for stream in u.json():
                 if stream['accessService'] == 'StandardVideo':
                     return stream
             return None
-        else:
-            raise ApiException(u.text)
+        raise ApiException(u.text)
 
     def get_livestream(self, path, with_subtitles=False):
         channel = self.get_programcard(path)['entries'][0]
         stream = {
             'subtitles': [],
             'url': self.get_channel_url(channel, with_subtitles)
-            }
+        }
         return stream
 
     def get_channel_url(self, channel, with_subtitles=False):
@@ -403,11 +652,7 @@ class Api():
                 'duration': duration,
                 'channels': channels,
             }
-            u = requests.get(url, params=data, timeout=GET_TIMEOUT)
-            if u.status_code == 200:
-                return u.json()
-            else:
-                raise ApiException(u.text)
+            return self._request_get(url, params=data, use_cache=True)
 
         schedules = []
         for i in range(1, 8):
@@ -434,7 +679,44 @@ class Api():
                     out[id] += f"{start} {item['item']['title']} \n"
         return out
 
+    # ------------------------------------------------------------------
+    # Account features (require a logged-in Api instance)
+    # ------------------------------------------------------------------
 
-class ApiException(Exception):
-    # normally pass this exception, to keep API alive in production
-    pass
+    def get_profile(self, use_cache=False):
+        url = URL + '/account/profile'
+        params = {"ff": "idp,ldp,rpt", "lang": "da"}
+        return self._request_get(url, params=params, headers=self._auth_headers(), use_cache=use_cache)
+
+    def get_mylist(self, use_cache=False):
+        url = URL + '/account/profile/bookmarks/list'
+        data = {'page_size': '24'}
+        headers = self._auth_headers()
+        item = self._request_get(url, params=data, headers=headers, use_cache=use_cache)
+        items = self.unfold_list(item, headers=headers)
+        for entry in items:
+            entry['in_mylist'] = True
+        return items
+
+    def get_continue(self, use_cache=False):
+        url = URL + '/account/profile/continue-watching/list'
+        data = {'page_size': '24'}
+        headers = self._auth_headers()
+        item = self._request_get(url, params=data, headers=headers, use_cache=use_cache)
+        items = self.unfold_list(item, headers=headers)
+        watched = self.get_profile().get('watched', {})
+        for entry in items:
+            entry['ResumeTime'] = float(watched.get(str(entry['id']), {'position': 0.0})['position'])
+        return items
+
+    def add_to_mylist(self, id):
+        url = f'{URL}/account/profile/bookmarks/{id}'
+        u = self.session.put(url, headers=self._auth_headers(), timeout=GET_TIMEOUT)
+        if u.status_code != 200:
+            raise ApiException(u.text)
+
+    def delete_from_mylist(self, id):
+        url = f'{URL}/account/profile/bookmarks/{id}'
+        u = self.session.delete(url, headers=self._auth_headers(), timeout=GET_TIMEOUT)
+        if u.status_code != 204:
+            raise ApiException(u.text)
