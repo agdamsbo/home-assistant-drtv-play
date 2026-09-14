@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import quote, unquote
 
 from homeassistant.components.media_player import BrowseError, MediaClass, MediaType
 from homeassistant.components.media_source import (
@@ -150,21 +151,22 @@ class DrtvMediaSource(MediaSource):
                 return await self.hass.async_add_executor_job(self._browse_continue, api)
 
             if identifier.startswith(PREFIX_BROWSE):
-                path = identifier[len(PREFIX_BROWSE):]
+                quoted_title, _, path = identifier[len(PREFIX_BROWSE):].partition(SEP)
                 return await self.hass.async_add_executor_job(
-                    self._browse_path, api, path, False, identifier
+                    self._browse_path, api, path, False, identifier, unquote(quoted_title)
                 )
 
             if identifier.startswith(PREFIX_SEASONS):
-                path = identifier[len(PREFIX_SEASONS):]
+                quoted_title, _, path = identifier[len(PREFIX_SEASONS):].partition(SEP)
                 return await self.hass.async_add_executor_job(
-                    self._browse_path, api, path, True, identifier
+                    self._browse_path, api, path, True, identifier, unquote(quoted_title)
                 )
 
             if identifier.startswith(PREFIX_LIST):
-                list_id, _, param = identifier[len(PREFIX_LIST):].partition(SEP)
+                quoted_title, _, rest = identifier[len(PREFIX_LIST):].partition(SEP)
+                list_id, _, param = rest.partition(SEP)
                 return await self.hass.async_add_executor_job(
-                    self._browse_list, api, list_id, param or "NoParam", identifier
+                    self._browse_list, api, list_id, param or "NoParam", identifier, unquote(quoted_title)
                 )
         except ApiException as err:
             raise BrowseError(str(err)) from err
@@ -222,7 +224,7 @@ class DrtvMediaSource(MediaSource):
             children.append(
                 BrowseMediaSource(
                     domain=DOMAIN,
-                    identifier=f"{PREFIX_BROWSE}{path}",
+                    identifier=f"{PREFIX_BROWSE}{quote(title, safe='')}{SEP}{path}",
                     media_class=MediaClass.DIRECTORY,
                     media_content_type=MediaType.VIDEO,
                     title=title,
@@ -315,7 +317,7 @@ class DrtvMediaSource(MediaSource):
         )
 
     def _browse_path(
-        self, api: Api, path: str, seasons: bool, identifier: str
+        self, api: Api, path: str, seasons: bool, identifier: str, title: str
     ) -> BrowseMediaSource:
         """List the contents of a DRTV path.
 
@@ -323,6 +325,11 @@ class DrtvMediaSource(MediaSource):
         "programcard" either lists several entries directly, or resolves
         to a single season (show more seasons, or its episodes) or a
         single list of related items.
+
+        `title` is the friendly name already shown for this folder in its
+        parent listing (carried in the identifier) - reusing it keeps the
+        browser header/breadcrumb consistent instead of trying to
+        re-derive a name from the API response for every page load.
         """
         card = api.get_programcard(path)
         entries = card.get("entries") or []
@@ -358,7 +365,6 @@ class DrtvMediaSource(MediaSource):
             else:
                 items = [entry]
 
-        title = self._page_title(api, card, path)
         children = [
             child
             for raw in items
@@ -370,14 +376,14 @@ class DrtvMediaSource(MediaSource):
             identifier=identifier,
             media_class=MediaClass.DIRECTORY,
             media_content_type=MediaType.VIDEO,
-            title=title,
+            title=title or path,
             can_play=False,
             can_expand=True,
             children=children,
         )
 
     def _browse_list(
-        self, api: Api, list_id: str, param: str, identifier: str
+        self, api: Api, list_id: str, param: str, identifier: str, title: str
     ) -> BrowseMediaSource:
         """List the contents of a DRTV "list" (id + parameter, no path)."""
         raw_list = api.get_list(list_id, param)
@@ -393,23 +399,13 @@ class DrtvMediaSource(MediaSource):
             identifier=identifier,
             media_class=MediaClass.DIRECTORY,
             media_content_type=MediaType.VIDEO,
-            title=raw_list.get("title", "DRTV"),
+            title=title or raw_list.get("title", "DRTV"),
             can_play=False,
             can_expand=True,
             children=children,
         )
 
     # -- helpers --
-
-    @staticmethod
-    def _page_title(api: Api, card: dict[str, Any], path: str) -> str:
-        page_item = card.get("item")
-        if page_item:
-            try:
-                return api.get_info(page_item)[0]
-            except (KeyError, TypeError):
-                return page_item.get("title", path)
-        return path
 
     def _item_to_browse(
         self, api: Api, raw: dict[str, Any], force_seasons: bool
@@ -453,13 +449,13 @@ class DrtvMediaSource(MediaSource):
         if is_folder:
             if path:
                 prefix = PREFIX_SEASONS if force_seasons and detail_type == "season" else PREFIX_BROWSE
-                identifier = f"{prefix}{path}"
+                identifier = f"{prefix}{quote(title, safe='')}{SEP}{path}"
             else:
                 list_info = raw.get("list") or detail.get("list")
                 if not list_info or not list_info.get("id"):
                     return None
                 param = list_info.get("parameter", "NoParam")
-                identifier = f"{PREFIX_LIST}{list_info['id']}{SEP}{param}"
+                identifier = f"{PREFIX_LIST}{quote(title, safe='')}{SEP}{list_info['id']}{SEP}{param}"
 
             media_class = MediaClass.DIRECTORY
             if detail_type == "season":
