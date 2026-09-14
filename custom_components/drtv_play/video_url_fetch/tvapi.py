@@ -10,6 +10,7 @@
 
 import base64
 import hashlib
+import logging
 import pickle
 import secrets
 import time
@@ -20,6 +21,9 @@ from urllib.parse import parse_qs, urlparse
 import requests
 import requests_cache
 from dateutil import parser
+
+_LOGGER = logging.getLogger(__name__)
+
 
 CHANNEL_IDS = [20875, 20876, 192099, 192100, 20892]
 CHANNEL_PRESET = {
@@ -50,6 +54,56 @@ class ApiException(Exception):
 
 class ApiAuthException(ApiException):
     """Raised when a login (initial or refresh) fails - credentials are bad."""
+
+
+def _find_image_url(obj):
+    """Recursively search for something that looks like an image URL.
+
+    Used as a last resort by pick_thumbnail() below, in case a given DR
+    endpoint doesn't use the flat {'tile': 'https://...'} shape we expect
+    (untested against the live API - see pick_thumbnail's docstring).
+    """
+    if isinstance(obj, str):
+        return obj if obj.startswith('http') else None
+    if isinstance(obj, dict):
+        for value in obj.values():
+            found = _find_image_url(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_image_url(value)
+            if found:
+                return found
+    return None
+
+
+def pick_thumbnail(images, preferred=('tile', 'poster', 'square', 'logo')):
+    """Best-effort thumbnail URL lookup from a DR "images" object.
+
+    DR doesn't necessarily expose the same label on every item/endpoint
+    (episodes vs. channels vs. category pages), and the ported code here
+    hasn't been verified against the live API for every shape - so this
+    checks a handful of known flat labels first and, if none match, falls
+    back to a recursive search for anything that looks like an image URL
+    rather than silently showing nothing. If thumbnails are still missing
+    after this, enable debug logging for this integration and check for
+    the "no recognizable image URL" message below to see the actual shape
+    DR is returning, so the label list here can be corrected.
+    """
+    if not images:
+        return None
+    for label in preferred:
+        value = images.get(label)
+        if isinstance(value, str) and value:
+            return value
+    found = _find_image_url(images)
+    if found is None:
+        _LOGGER.debug(
+            "DRTV: no recognizable image URL in images object with keys %s: %r",
+            list(images.keys()), images,
+        )
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +597,11 @@ class Api():
                 if title.startswith('DRTV Hero'):
                     title = 'Daglige forslag'
                 if title:
-                    items.append({'title': title, 'path': item['list']['path']})
+                    # Carry any thumbnail along too - it may sit on the
+                    # entry itself or on the nested list, depending on the
+                    # entry type, so check both.
+                    images = item.get('images') or item.get('list', {}).get('images')
+                    items.append({'title': title, 'path': item['list']['path'], 'images': images})
         return items
 
     def getLiveTV(self):
