@@ -66,6 +66,41 @@ async def async_get_api(hass) -> Api:
     return domain_data[_ANON_KEY]
 
 
+def _pick_thumbnail(images, preferred=("tile", "poster", "square")):
+    """Best-effort thumbnail lookup - DR doesn't consistently populate the
+    same image label on every item (channels use 'logo' rather than
+    'tile'/'poster'/'square'), so fall back through a few common ones
+    instead of assuming one always exists (which would otherwise crash
+    the whole service call with a KeyError)."""
+    if not images:
+        return None
+    for label in preferred:
+        if images.get(label):
+            return images[label]
+    return None
+
+
+def _channel_metadata(channel):
+    """Build a friendly title/thumbnail for a live channel.
+
+    Uses the currently-airing programme (from the schedule string already
+    fetched by getLiveTV()) rather than just the bare channel name, so the
+    media player shows e.g. "DR1 - TV Avisen" instead of just "DR1".
+    """
+    title = channel.get("title", "DRTV")
+    schedule = (channel.get("schedule_str") or "").strip()
+    if schedule:
+        first_line = schedule.splitlines()[0].strip()
+        # Lines look like "20:00 Some Programme Title" - drop the leading
+        # HH:MM if present.
+        _, _, now_playing = first_line.partition(" ")
+        now_playing = now_playing.strip() or first_line
+        if now_playing:
+            title = f"{title} - {now_playing}"
+    thumb = _pick_thumbnail(channel.get("item", {}).get("images"), preferred=("logo", "tile", "poster", "square"))
+    return title, thumb
+
+
 async def async_setup(hass, config):
 
     async def play_latest(service):
@@ -88,8 +123,8 @@ async def async_setup(hass, config):
                 'media_content_id': url,
                 'media_content_type': 'video',
                 'extra': {
-                    'title': item['title'],
-                    'thumb': item['images']['tile'],
+                    'title': item.get('title', program_name),
+                    'thumb': _pick_thumbnail(item.get('images')),
                 }
             })
     hass.services.async_register(
@@ -107,18 +142,25 @@ async def async_setup(hass, config):
             channels = api.getLiveTV()
 
             url = None
+            metadata = None
             for item in channels:
                 if item['title'].lower() == channel.lower():
                     url = api.get_channel_url(item, with_subtitles=subtitles)
-            return url
+                    metadata = _channel_metadata(item)
+            return url, metadata
         api = await async_get_api(hass)
-        video_url = await hass.async_add_executor_job(fetch_video_url, api)
+        video_url, metadata = await hass.async_add_executor_job(fetch_video_url, api)
 
         if video_url:
+            title, thumb = metadata
             await hass.services.async_call('media_player', 'play_media', {
                 'entity_id': entity_id,
                 'media_content_id': video_url,
-                'media_content_type': 'video'
+                'media_content_type': 'video',
+                'extra': {
+                    'title': title,
+                    'thumb': thumb,
+                }
             })
         else:
             _LOGGER.error("Unknown DRTV channel: %s", channel)
