@@ -597,12 +597,45 @@ class Api():
         }
         return stream
 
-    def get_channel_url(self, channel, with_subtitles=False):
+    def get_channel_url(self, channel, with_subtitles=False, use_cache=False):
+        """Return a working live-stream URL for a channel.
+
+        DR publishes several delivery variants for the same channel - a
+        Danish CDN one and an "Eu" one for viewers outside Denmark, each
+        with/without subtitles - and not every channel exposes every
+        variant. Querying the live channel's own customFields (the old
+        approach) returns a fixed field that DR has in practice stopped
+        keeping current, which is why live channels could fail to stream
+        even though VOD playback (a different endpoint) works fine.
+        Instead, ask the dedicated liveStreams endpoint what's actually
+        available and pick the best match automatically, falling back
+        through the other variants rather than assuming one fixed key.
+        """
+        id = channel['item']['id']
+        url = URL + f'/channels/{id}/liveStreams?'
+        headers = {"X-Authorization": f'Bearer {self.profile_token()}'}
+        js = self._request_get(url, headers=headers, use_cache=use_cache)
+        links = {item['type']: item['link'] for item in js if item.get('link')}
+
         if with_subtitles:
-            url = channel['item']['customFields']['hlsWithSubtitlesURL']
+            preference = [
+                'hlsWithSubtitlesURLEu', 'hlsWithSubtitlesURL', 'hlsURLEu', 'hlsURL',
+            ]
         else:
-            url = channel['item']['customFields']['hlsURL']
-        return url
+            preference = [
+                'hlsURLEu', 'hlsURL', 'hlsWithSubtitlesURLEu', 'hlsWithSubtitlesURL',
+            ]
+
+        for key in preference:
+            if key in links:
+                return links[key]
+
+        if links:
+            # Unknown/renamed variant name - better to play *something*
+            # than nothing.
+            return next(iter(links.values()))
+
+        raise ApiException(f'DRTV did not return any live stream links for channel {id}')
 
     def get_info(self, item):
         title = item['title']
