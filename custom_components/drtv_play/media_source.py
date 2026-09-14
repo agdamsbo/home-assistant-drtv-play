@@ -30,7 +30,7 @@ from homeassistant.components.media_source import (
 from homeassistant.core import HomeAssistant
 
 from . import DOMAIN, async_get_api
-from .video_url_fetch.tvapi import Api, ApiException
+from .video_url_fetch.tvapi import Api, ApiException, pick_thumbnail
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -230,6 +230,7 @@ class DrtvMediaSource(MediaSource):
                     title=title,
                     can_play=False,
                     can_expand=True,
+                    thumbnail=pick_thumbnail(entry.get("images")),
                 )
             )
 
@@ -252,7 +253,7 @@ class DrtvMediaSource(MediaSource):
             title = channel.get("title")
             if not title:
                 continue
-            image = channel.get("item", {}).get("images", {}).get("logo")
+            image = pick_thumbnail(channel.get("item", {}).get("images"), preferred=("logo", "tile", "poster", "square"))
             children.append(
                 BrowseMediaSource(
                     domain=DOMAIN,
@@ -435,11 +436,7 @@ class DrtvMediaSource(MediaSource):
             pass
 
         images = detail.get("images") or raw.get("images") or {}
-        thumbnail = None
-        for label in ("tile", "poster", "square"):
-            if images.get(label):
-                thumbnail = images[label]
-                break
+        thumbnail = pick_thumbnail(images)
 
         is_folder = detail_type not in PLAYABLE_TYPES
         path = raw.get("path") or detail.get("path")
