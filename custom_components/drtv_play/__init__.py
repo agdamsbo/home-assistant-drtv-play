@@ -4,7 +4,7 @@ import voluptuous as vol
 from homeassistant.const import CONF_USERNAME, CONF_PASSWORD
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
-from .video_url_fetch.tvapi import Api, ApiAuthException, ApiException
+from .video_url_fetch.tvapi import Api, ApiAuthException, ApiException, pick_thumbnail
 
 DOMAIN = "drtv_play"
 
@@ -66,20 +66,6 @@ async def async_get_api(hass) -> Api:
     return domain_data[_ANON_KEY]
 
 
-def _pick_thumbnail(images, preferred=("tile", "poster", "square")):
-    """Best-effort thumbnail lookup - DR doesn't consistently populate the
-    same image label on every item (channels use 'logo' rather than
-    'tile'/'poster'/'square'), so fall back through a few common ones
-    instead of assuming one always exists (which would otherwise crash
-    the whole service call with a KeyError)."""
-    if not images:
-        return None
-    for label in preferred:
-        if images.get(label):
-            return images[label]
-    return None
-
-
 def _channel_metadata(channel):
     """Build a friendly title/thumbnail for a live channel.
 
@@ -97,7 +83,7 @@ def _channel_metadata(channel):
         now_playing = now_playing.strip() or first_line
         if now_playing:
             title = f"{title} - {now_playing}"
-    thumb = _pick_thumbnail(channel.get("item", {}).get("images"), preferred=("logo", "tile", "poster", "square"))
+    thumb = pick_thumbnail(channel.get("item", {}).get("images"), preferred=("logo", "tile", "poster", "square"))
     return title, thumb
 
 
@@ -124,7 +110,7 @@ async def async_setup(hass, config):
                 'media_content_type': 'video',
                 'extra': {
                     'title': item.get('title', program_name),
-                    'thumb': _pick_thumbnail(item.get('images')),
+                    'thumb': pick_thumbnail(item.get('images')),
                 }
             })
     hass.services.async_register(
