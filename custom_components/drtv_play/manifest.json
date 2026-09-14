@@ -1,7 +1,7 @@
 {
     "domain": "drtv_play",
     "name": "DRTV Play",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "documentation": "https://github.com/agdamsbo/home-assistant-drtv-play",
     "issue_tracker": "https://github.com/agdamsbo/home-assistant-drtv-play/issues",
     "iot_class": "cloud_polling",
