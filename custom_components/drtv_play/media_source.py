@@ -30,6 +30,7 @@ from homeassistant.components.media_source import (
 from homeassistant.core import HomeAssistant
 
 from . import DOMAIN, async_get_api
+from .kodi_helper import build_kodi_play_url, is_kodi_entity
 from .video_url_fetch.tvapi import Api, ApiException, pick_thumbnail
 
 _LOGGER = logging.getLogger(__name__)
@@ -97,7 +98,19 @@ class DrtvMediaSource(MediaSource):
 
         try:
             if identifier.startswith(PREFIX_PLAY):
-                video_id = identifier[len(PREFIX_PLAY):]
+                # Identifier is "play::<id>" or "play::<id>::<path>" (the
+                # path is optional so older saved identifiers keep working).
+                video_id, _, path = identifier[len(PREFIX_PLAY):].partition(SEP)
+
+                # Kodi's built-in player can't open DRTV's fMP4 HLS streams, so
+                # for Kodi targets hand over a plugin:// URL and let the Kodi
+                # DR add-on resolve it with inputstream.adaptive.
+                target = getattr(item, "target_media_player", None)
+                if is_kodi_entity(self.hass, target):
+                    kodi_url = build_kodi_play_url(video_id, path)
+                    _LOGGER.debug("Resolving %s for Kodi player %s as %s", video_id, target, kodi_url)
+                    return PlayMedia(kodi_url, STREAM_MIME_TYPE)
+
                 stream = await self.hass.async_add_executor_job(api.get_stream, video_id)
                 if not stream or not stream.get("url"):
                     raise Unresolvable(f"DRTV did not return a stream for id {video_id}")
@@ -479,7 +492,7 @@ class DrtvMediaSource(MediaSource):
         media_class = MediaClass.EPISODE if detail_type == "episode" else MediaClass.MOVIE
         return BrowseMediaSource(
             domain=DOMAIN,
-            identifier=f"{PREFIX_PLAY}{video_id}",
+            identifier=f"{PREFIX_PLAY}{video_id}{SEP + path if path else ''}",
             media_class=media_class,
             media_content_type=MediaType.VIDEO,
             title=title,

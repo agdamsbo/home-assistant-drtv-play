@@ -4,6 +4,7 @@ import voluptuous as vol
 from homeassistant.const import CONF_USERNAME, CONF_PASSWORD
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
+from .kodi_helper import build_kodi_play_url, is_kodi_entity
 from .video_url_fetch.tvapi import Api, ApiAuthException, ApiException, pick_thumbnail
 
 DOMAIN = "drtv_play"
@@ -104,15 +105,32 @@ async def async_setup(hass, config):
         api = await async_get_api(hass)
         url, item = await hass.async_add_executor_job(fetch_video_url, api)
         if url:
-            await hass.services.async_call('media_player', 'play_media', {
-                'entity_id': entity_id,
-                'media_content_id': url,
-                'media_content_type': 'video',
-                'extra': {
-                    'title': item.get('title', program_name),
-                    'thumb': pick_thumbnail(item.get('images')),
-                }
-            })
+            entity_ids = entity_id if isinstance(entity_id, (list, tuple)) else [entity_id]
+            kodi_ids = [e for e in entity_ids if is_kodi_entity(hass, e)]
+            other_ids = [e for e in entity_ids if e not in kodi_ids]
+            extra = {
+                'title': item.get('title', program_name),
+                'thumb': pick_thumbnail(item.get('images')),
+            }
+
+            if other_ids:
+                await hass.services.async_call('media_player', 'play_media', {
+                    'entity_id': other_ids,
+                    'media_content_id': url,
+                    'media_content_type': 'video',
+                    'extra': extra,
+                })
+            if kodi_ids:
+                # Kodi can't play DRTV's fMP4 HLS with its built-in player;
+                # let the Kodi DR add-on resolve it (see kodi_helper.py).
+                kodi_url = build_kodi_play_url(item['id'], item.get('path'))
+                _LOGGER.debug("Playing %s on Kodi %s via %s", program_name, kodi_ids, kodi_url)
+                await hass.services.async_call('media_player', 'play_media', {
+                    'entity_id': kodi_ids,
+                    'media_content_id': kodi_url,
+                    'media_content_type': 'video',
+                    'extra': extra,
+                })
     hass.services.async_register(
         DOMAIN, SERVICE_PLAY_LATEST, play_latest, SERVICE_PLAY_LATEST_SCHEMA
     )

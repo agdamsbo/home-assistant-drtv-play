@@ -55,6 +55,12 @@ automation:
       channel: dr2
 ```
 
+## Playing on Kodi
+
+DRTV's on-demand streams are fragmented-MP4 HLS, which Kodi's built-in player cannot open (Cast devices can). When the target `media_player` is a Kodi player, this integration therefore hands Kodi a `plugin://plugin.video.drnu/...` URL instead of the raw stream, so the Kodi DR add-on resolves it with `inputstream.adaptive`, exactly like when you play from the add-on itself.
+
+Requirements: the [plugin.video.drnu](https://github.com/xbmc-danish-addons/plugin.video.drnu) add-on (which in turn needs `inputstream.adaptive`) must be installed on the Kodi device. This applies to the Media Source browser and the `play_latest` action. `play_channel` (live TV) is unchanged.
+
 ## Get the `program_name` field
 
 1. Search and click on the program you want at [dr.dk/tv](https://www.dr.dk/tv)
