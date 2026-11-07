@@ -4,7 +4,7 @@ import voluptuous as vol
 from homeassistant.const import CONF_USERNAME, CONF_PASSWORD
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
-from .kodi_helper import build_kodi_play_url, is_kodi_entity
+from .kodi_helper import build_kodi_live_url, build_kodi_play_url, is_kodi_entity
 from .video_url_fetch.tvapi import Api, ApiAuthException, ApiException, pick_thumbnail
 
 DOMAIN = "drtv_play"
@@ -142,32 +142,55 @@ async def async_setup(hass, config):
         channel = service.data.get(CONF_CHANNEL)
         subtitles = service.data.get(CONF_SUBTITLES)
 
+        entity_ids = entity_id if isinstance(entity_id, (list, tuple)) else [entity_id]
+        kodi_ids = [e for e in entity_ids if is_kodi_entity(hass, e)]
+        other_ids = [e for e in entity_ids if e not in kodi_ids]
+
         def fetch_video_url(api):
             channels = api.getLiveTV()
 
             url = None
             metadata = None
+            channel_id = None
             for item in channels:
                 if item['title'].lower() == channel.lower():
-                    url = api.get_channel_url(item, with_subtitles=subtitles)
+                    channel_id = item['item']['id']
+                    # Kodi players resolve the stream themselves, so only
+                    # fetch the stream URL when a non-Kodi player needs it.
+                    if other_ids:
+                        url = api.get_channel_url(item, with_subtitles=subtitles)
                     metadata = _channel_metadata(item)
-            return url, metadata
+            return url, metadata, channel_id
         api = await async_get_api(hass)
-        video_url, metadata = await hass.async_add_executor_job(fetch_video_url, api)
+        video_url, metadata, channel_id = await hass.async_add_executor_job(fetch_video_url, api)
 
-        if video_url:
-            title, thumb = metadata
+        if channel_id is None:
+            _LOGGER.error("Unknown DRTV channel: %s", channel)
+            return
+
+        title, thumb = metadata
+        extra = {
+            'title': title,
+            'thumb': thumb,
+        }
+        if other_ids and video_url:
             await hass.services.async_call('media_player', 'play_media', {
-                'entity_id': entity_id,
+                'entity_id': other_ids,
                 'media_content_id': video_url,
                 'media_content_type': 'video',
-                'extra': {
-                    'title': title,
-                    'thumb': thumb,
-                }
+                'extra': extra,
             })
-        else:
-            _LOGGER.error("Unknown DRTV channel: %s", channel)
+        if kodi_ids:
+            # Kodi can't play DRTV streams with its built-in player; let the
+            # Kodi DR add-on resolve the channel (see kodi_helper.py).
+            kodi_url = build_kodi_live_url(channel_id)
+            _LOGGER.debug("Playing channel %s on Kodi %s via %s", channel, kodi_ids, kodi_url)
+            await hass.services.async_call('media_player', 'play_media', {
+                'entity_id': kodi_ids,
+                'media_content_id': kodi_url,
+                'media_content_type': 'video',
+                'extra': extra,
+            })
     hass.services.async_register(
         DOMAIN, SERVICE_PLAY_CHANNEL, play_channel, SERVICE_PLAY_CHANNEL_SCHEMA
     )

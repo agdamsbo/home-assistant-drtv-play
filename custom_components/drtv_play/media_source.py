@@ -30,7 +30,7 @@ from homeassistant.components.media_source import (
 from homeassistant.core import HomeAssistant
 
 from . import DOMAIN, async_get_api
-from .kodi_helper import build_kodi_play_url, is_kodi_entity
+from .kodi_helper import build_kodi_live_url, build_kodi_play_url, is_kodi_entity
 from .video_url_fetch.tvapi import Api, ApiException, pick_thumbnail
 
 _LOGGER = logging.getLogger(__name__)
@@ -123,6 +123,15 @@ class DrtvMediaSource(MediaSource):
                 )
                 if channel is None:
                     raise Unresolvable(f"Unknown DRTV channel: {title}")
+
+                # Let the Kodi DR add-on resolve live channels for Kodi targets
+                # (see kodi_helper.py).
+                target = getattr(item, "target_media_player", None)
+                if is_kodi_entity(self.hass, target):
+                    kodi_url = build_kodi_live_url(channel["item"]["id"])
+                    _LOGGER.debug("Resolving channel %s for Kodi player %s as %s", title, target, kodi_url)
+                    return PlayMedia(kodi_url, STREAM_MIME_TYPE)
+
                 url = await self.hass.async_add_executor_job(
                     api.get_channel_url, channel, False
                 )

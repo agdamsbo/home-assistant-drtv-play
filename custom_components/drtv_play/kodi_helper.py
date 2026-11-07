@@ -49,3 +49,14 @@ def build_kodi_play_url(video_id: str | int, path: str | None = None) -> str:
         f"plugin://{KODI_DRNU_ADDON_ID}/"
         f"?playVideo={video_id}&kids=False&idpath={quote(path or '', safe='/')}"
     )
+
+
+def build_kodi_live_url(channel_id: str | int) -> str:
+    """Build the plugin URL that makes the Kodi DR add-on play a live channel.
+
+    The add-on's ``playVideo`` handler treats an ``idpath`` starting with
+    ``/kanal`` as a live channel: it resolves the channel's current stream and
+    plays it with ``inputstream.adaptive``, like on-demand videos. Subtitles
+    follow the add-on's own "live TV subtitles" setting.
+    """
+    return build_kodi_play_url(channel_id, f"/kanal/{channel_id}")
